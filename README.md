@@ -65,13 +65,18 @@ python -m teleoperation.teleop --speed-percent 5 --alpha 0.3
 
 ## 2. 连续录制（推荐）
 
-Leader 始终处于 Standby 可拖动状态，follower 全程 MIT 跟随。按 ENTER 开始/停止录制约。停止后立即异步转码视频，同时允许用户继续拖动 leader 至下一段起始位。
+Leader 始终处于 Standby 可拖动状态，follower 全程 MIT 跟随。按 ENTER 开始/停止录制。每个控制周期遵循 LeRobot 官方顺序：先读取完整 follower observation（关节、末端、夹爪和相机），再读取 leader action，发送经过滤波/限速的 follower 目标，最后把 observation 与实际发送的 action 写入同一帧。
+
+夹爪同样遵循该语义：`observation.state[6]` 是发送前读取的
+follower 实际开口，`action[6]` 是本周期过滤/限速后实际下发的目标。
+如果 follower 夹爪反馈暂时不可用，该帧会被丢弃而不会用 `0.0` 伪造，
+丢帧数记录在 episode timing 的 `skipped_gripper_samples` 中。
 
 ```bash
 python -m teleoperation.record_continuous \
   --repo-id local/piper-demo \
   --root ./data/piper-demo \
-  --fps 50 \
+  --fps 30 \
   --tasks tasks.json \
   --speed-percent 5
 ```
@@ -82,7 +87,7 @@ python -m teleoperation.record_continuous \
 | `--follower-can` | can0 | |
 | `--repo-id` | local/piper-demo | 数据集标识 |
 | `--root` | ./data | 数据集根目录 |
-| `--fps` | 50 | 录制帧率 |
+| `--fps` | 30 | 目标控制/数据帧率；默认匹配双相机，实际帧率逐帧记录并按 episode 汇总 |
 | `--tasks` | None | JSON 任务列表文件 |
 | `--force` | false | 覆盖已有数据集 |
 | `--disable-cameras` | false | 不录相机 |
@@ -90,6 +95,8 @@ python -m teleoperation.record_continuous \
 | `--speed-percent` | 10 | |
 | `--alpha` | 0.3 | 低通滤波 |
 | `--config` | deploy/configs/piper_gemini_d435i.yaml | 相机配置 |
+
+固定频率循环会从每周期预算中扣除读取、控制和写入耗时，不再在处理完成后额外固定 sleep。若处理时间超过周期，会记录 overrun 且不会突发补发控制点。相机慢于 `--fps` 时可能复用最近一帧；数据里保存每台相机真实 frame number 和时间戳，因此可准确识别复用和图像延迟。
 
 ## 3. 定长录制
 
@@ -137,7 +144,7 @@ python -m teleoperation.record_interactive \
 
 数据集使用模型 TCP 坐标系，与 `deploy` 一致：
 
-- `observation.state`：`[x, y, z, rx, ry, rz]`（6 维），**从臂当前位姿**
+- `observation.state`：`[x, y, z, rx, ry, rz, gripper]`（7 维），**发送 action 前读取的从臂当前状态**
 - `action`：`[x, y, z, rx, ry, rz, gripper]`（7 维），**绝对位姿目标**
 
 单位：位置为米，Euler 角为弧度，夹爪为米制开口量。
@@ -152,7 +159,8 @@ python -m teleoperation.record_interactive \
 │   ├── info.json
 │   ├── episodes.jsonl
 │   ├── episodes_stats.jsonl
-│   └── tasks.jsonl
+│   ├── tasks.jsonl
+│   └── recording_timing.jsonl  # 每个 episode 的目标/实测频率与抖动
 ├── data/
 │   └── chunk-000/
 │       └── episode_000000.parquet
@@ -170,8 +178,26 @@ Features：
 |---|---|---|---|
 | `observation.images.wrist_cam` | video | (480,640,3) | Gemini 305 腕部 |
 | `observation.images.opst_cam` | video | (480,640,3) | D435i 第三视角 |
-| `observation.state` | float32 | (6,) | 从臂模型 TCP |
+| `observation.state` | float32 | (7,) | 从臂模型 TCP + 夹爪真实反馈 |
 | `action` | float32 | (7,) | 绝对位姿目标 |
+
+LeRobot 标准 `timestamp` 保持官方定义 `frame_index / fps`，用于视频编码、按帧索引和官方同步校验；真实时间另外保存在以下 parquet 字段中：
+
+| Key | dtype | 说明 |
+|---|---|---|
+| `recording.sample_monotonic_ns` | int64 | 本轮采样开始的主机单调时钟 |
+| `recording.sample_wall_time_ns` | int64 | 本轮采样开始的 Unix 时间 |
+| `recording.observation_monotonic_ns` | int64 | follower observation 读取完成时刻 |
+| `recording.action_sent_monotonic_ns` | int64 | follower action 下发完成时刻 |
+| `recording.actual_dt_s` | float32 | 与上一条实际写入样本的时间间隔 |
+| `recording.actual_fps` | float32 | 本帧对应的瞬时实测频率 |
+| `recording.target_fps` | float32 | 命令行请求的目标频率 |
+| `recording.camera_host_timestamp_ns.<camera>` | int64 | 相机帧到达主机的单调时钟 |
+| `recording.camera_device_timestamp_ms.<camera>` | float64 | 相机设备时间戳 |
+| `recording.camera_frame_number.<camera>` | int64 | 真实相机帧号，可检查重复图像 |
+| `recording.camera_age_ms.<camera>` | float32 | 图像相对 observation 的时间差 |
+
+`meta/recording_timing.jsonl` 逐 episode 保存 `target_fps`、`measured_fps`、平均/中位/最小/最大周期、相机丢弃样本数和控制循环 overrun 数。
 
 ## 诊断工具
 
