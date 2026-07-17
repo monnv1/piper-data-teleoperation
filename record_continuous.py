@@ -3,7 +3,7 @@
 流程：
   1. 连接双臂 → 使能 → 主臂 Standby（重力补偿，可自由拖拽）
                             从臂 MIT 高跟随模式（循环跟随主臂）
-  2. 跟随循环 50Hz 持续运行，从臂一直跟着主臂走
+  2. 固定频率跟随循环持续运行，从臂一直跟着主臂走
   3. ENTER → 开始录制数据帧
   4. ENTER → 停止录制 → 保存该段数据（后处理期间双臂照常跟随）
   5. 用户趁后处理时布置场地，拖主臂到新位置
@@ -24,6 +24,7 @@ import math
 import shutil
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -103,6 +104,29 @@ def _build_features(config, use_cameras: bool) -> dict:
             "dtype": "float32", "shape": (7,),
             "names": ["x", "y", "z", "rx", "ry", "rz", "gripper"],
         },
+        # LeRobot's built-in timestamp stays on its nominal frame_index / fps
+        # grid. These fields preserve the actual acquisition/send times.
+        "recording.sample_monotonic_ns": {
+            "dtype": "int64", "shape": (1,), "names": ["nanoseconds"],
+        },
+        "recording.sample_wall_time_ns": {
+            "dtype": "int64", "shape": (1,), "names": ["unix_nanoseconds"],
+        },
+        "recording.observation_monotonic_ns": {
+            "dtype": "int64", "shape": (1,), "names": ["nanoseconds"],
+        },
+        "recording.action_sent_monotonic_ns": {
+            "dtype": "int64", "shape": (1,), "names": ["nanoseconds"],
+        },
+        "recording.actual_dt_s": {
+            "dtype": "float32", "shape": (1,), "names": ["seconds"],
+        },
+        "recording.actual_fps": {
+            "dtype": "float32", "shape": (1,), "names": ["hertz"],
+        },
+        "recording.target_fps": {
+            "dtype": "float32", "shape": (1,), "names": ["hertz"],
+        },
     }
     if use_cameras:
         for name, cam_cfg in config.cameras.items():
@@ -112,6 +136,18 @@ def _build_features(config, use_cameras: bool) -> dict:
                 "dtype": "video",
                 "shape": (cam_cfg.height, cam_cfg.width, 3),
                 "names": ["height", "width", "channel"],
+            }
+            features[f"recording.camera_host_timestamp_ns.{name}"] = {
+                "dtype": "int64", "shape": (1,), "names": ["nanoseconds"],
+            }
+            features[f"recording.camera_device_timestamp_ms.{name}"] = {
+                "dtype": "float64", "shape": (1,), "names": ["milliseconds"],
+            }
+            features[f"recording.camera_frame_number.{name}"] = {
+                "dtype": "int64", "shape": (1,), "names": ["frame_number"],
+            }
+            features[f"recording.camera_age_ms.{name}"] = {
+                "dtype": "float32", "shape": (1,), "names": ["milliseconds"],
             }
     return features
 
@@ -191,21 +227,48 @@ def _wait_for_cameras(buffers: dict[str, FrameBuffer], timeout_s: float) -> None
     raise TimeoutError(f"Timed out waiting for camera frames: {missing}")
 
 
-def _camera_frames_for_timestamp(buffers: dict[str, FrameBuffer],
-                                 timestamp_ns: int,
-                                 tolerance_ms: float) -> dict[str, np.ndarray]:
+def _camera_observation(
+    buffers: dict[str, FrameBuffer],
+    observation_timestamp_ns: int,
+    tolerance_ms: float,
+) -> dict[str, np.ndarray] | None:
+    """Snapshot every latest camera frame as part of the observation.
+
+    This mirrors LeRobot's robot.get_observation(): camera data belongs to the
+    observation and is captured before reading/sending the teleoperator action.
+    A partial camera observation is never written.
+    """
     tolerance_ns = int(tolerance_ms * 1_000_000.0)
-    images = {}
+    observation = {}
     for name, buf in buffers.items():
-        frame = buf.nearest(timestamp_ns, tolerance_ns)
+        frame = buf.latest()
         if frame is None:
+            logging.warning("No frame available for %s; skipping sample", name)
+            return None
+        age_ns = observation_timestamp_ns - frame.host_timestamp_ns
+        if abs(age_ns) > tolerance_ns:
             logging.warning(
-                "No synced frame for %s within %.1f ms, skipping",
-                name, tolerance_ms,
+                "Latest %s frame is %.1f ms from observation (limit %.1f ms); "
+                "skipping sample",
+                name,
+                age_ns / 1_000_000.0,
+                tolerance_ms,
             )
-            continue
-        images[f"observation.images.{name}"] = np.asarray(frame.rgb).copy()
-    return images
+            return None
+        observation[f"observation.images.{name}"] = np.asarray(frame.rgb).copy()
+        observation[f"recording.camera_host_timestamp_ns.{name}"] = np.asarray(
+            [frame.host_timestamp_ns], dtype=np.int64
+        )
+        observation[f"recording.camera_device_timestamp_ms.{name}"] = np.asarray(
+            [frame.device_timestamp_ms], dtype=np.float64
+        )
+        observation[f"recording.camera_frame_number.{name}"] = np.asarray(
+            [frame.frame_number], dtype=np.int64
+        )
+        observation[f"recording.camera_age_ms.{name}"] = np.asarray(
+            [age_ns / 1_000_000.0], dtype=np.float32
+        )
+    return observation
 
 
 # ── arm status helpers (minimal, for logging only) ──────────────────────
@@ -303,6 +366,113 @@ class _FollowState:
         self.current_task: str | None = None
         self.recording: bool = False
         self.stop_event = threading.Event()
+        self.record_lock = threading.Lock()
+        self.recorded_sample_ns: list[int] = []
+        self.skipped_camera_samples: int = 0
+        self.control_overruns: int = 0
+
+    def begin_episode(self, task: str) -> None:
+        with self.record_lock:
+            self.current_task = task
+            self.recorded_sample_ns = []
+            self.skipped_camera_samples = 0
+            self.control_overruns = 0
+            self.recording = True
+
+    def finish_episode(self) -> tuple[list[int], int, int]:
+        with self.record_lock:
+            self.recording = False
+            self.current_task = None
+            return (
+                self.recorded_sample_ns.copy(),
+                self.skipped_camera_samples,
+                self.control_overruns,
+            )
+
+
+@dataclass(frozen=True)
+class _EpisodeTimingSummary:
+    frames: int
+    target_fps: float
+    measured_fps: float
+    duration_s: float
+    mean_dt_s: float
+    median_dt_s: float
+    min_dt_s: float
+    max_dt_s: float
+    skipped_camera_samples: int
+    control_overruns: int
+
+
+def _summarize_episode_timing(
+    timestamps_ns: list[int],
+    target_fps: float,
+    skipped_camera_samples: int,
+    control_overruns: int,
+) -> _EpisodeTimingSummary:
+    if len(timestamps_ns) < 2:
+        return _EpisodeTimingSummary(
+            frames=len(timestamps_ns),
+            target_fps=float(target_fps),
+            measured_fps=0.0,
+            duration_s=0.0,
+            mean_dt_s=0.0,
+            median_dt_s=0.0,
+            min_dt_s=0.0,
+            max_dt_s=0.0,
+            skipped_camera_samples=skipped_camera_samples,
+            control_overruns=control_overruns,
+        )
+    deltas_s = np.diff(np.asarray(timestamps_ns, dtype=np.int64)) / 1e9
+    duration_s = (timestamps_ns[-1] - timestamps_ns[0]) / 1e9
+    return _EpisodeTimingSummary(
+        frames=len(timestamps_ns),
+        target_fps=float(target_fps),
+        measured_fps=(len(timestamps_ns) - 1) / duration_s,
+        duration_s=duration_s,
+        mean_dt_s=float(np.mean(deltas_s)),
+        median_dt_s=float(np.median(deltas_s)),
+        min_dt_s=float(np.min(deltas_s)),
+        max_dt_s=float(np.max(deltas_s)),
+        skipped_camera_samples=skipped_camera_samples,
+        control_overruns=control_overruns,
+    )
+
+
+def _append_episode_timing_metadata(
+    dataset_root: Path,
+    episode_index: int,
+    task: str,
+    summary: _EpisodeTimingSummary,
+) -> None:
+    metadata_path = Path(dataset_root) / "meta" / "recording_timing.jsonl"
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "episode_index": episode_index,
+        "task": task,
+        **summary.__dict__,
+        "timestamp_semantics": {
+            "timestamp": "LeRobot nominal frame_index / fps seconds",
+            "recording.sample_monotonic_ns": "actual host monotonic sample start",
+            "recording.sample_wall_time_ns": "actual Unix wall-clock sample start",
+            "recording.observation_monotonic_ns": "follower observation complete",
+            "recording.action_sent_monotonic_ns": "follower command sent",
+        },
+    }
+    with metadata_path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _sleep_until_ns(deadline_ns: int) -> None:
+    """Sleep most of the interval, then yield-spin to the monotonic deadline."""
+    while True:
+        remaining_ns = deadline_ns - time.monotonic_ns()
+        if remaining_ns <= 0:
+            return
+        if remaining_ns > 1_000_000:
+            time.sleep((remaining_ns - 500_000) / 1e9)
+        else:
+            time.sleep(0)
 
 
 def _follow_loop(
@@ -324,17 +494,44 @@ def _follow_loop(
     fk,
     frames: PiperFrameTransform,
 ) -> None:
-    """后台跟随线程：50Hz 读主臂 → 滤波 → 发从臂，录制时同时存帧。"""
-    period = 1.0 / fps
+    """LeRobot-style loop: observation -> teleop action -> send -> record."""
+    period_ns = int(round(1_000_000_000 / fps))
+    next_deadline_ns = time.monotonic_ns()
 
     while not state.stop_event.is_set():
-        host_timestamp_ns = time.monotonic_ns()
+        sample_start_ns = time.monotonic_ns()
+        sample_wall_time_ns = time.time_ns()
+        with state.record_lock:
+            capture_recording_frame = state.recording
 
-        # ── 读主臂 ──
-        raw = read_joints(leader)
+        # ── 1. observation：先完整读取从臂反馈和相机 ──
         follower_raw = read_joints(follower)
-        leader_joints_deg = (np.asarray(raw, dtype=np.float32) / 1000.0).astype(np.float32)
-        follower_joints_deg = (np.asarray(follower_raw, dtype=np.float32) / 1000.0).astype(np.float32)
+        follower_joints_deg = (
+            np.asarray(follower_raw, dtype=np.float32) / 1000.0
+        ).astype(np.float32)
+        state_pose = _model_pose_from_sdk_units(
+            _read_sdk_pose_units(follower), frames
+        )
+        state_gripper_m = _read_gripper_m(follower)
+        state_pose = np.concatenate(
+            [state_pose, np.asarray([state_gripper_m], dtype=np.float32)]
+        ).astype(np.float32)
+        observation_timestamp_ns = time.monotonic_ns()
+        camera_observation = (
+            _camera_observation(
+                camera_buffers,
+                observation_timestamp_ns,
+                camera_tolerance_ms,
+            )
+            if capture_recording_frame and camera_buffers
+            else {}
+        )
+
+        # ── 2. teleop action：再读取主臂并生成实际发送目标 ──
+        raw = read_joints(leader)
+        leader_joints_deg = (
+            np.asarray(raw, dtype=np.float32) / 1000.0
+        ).astype(np.float32)
 
         # ── 低通 + 限速 ──
         if state.last_filtered is None:
@@ -348,10 +545,6 @@ def _follow_loop(
         state.last_filtered = filtered
         target_joints = map_follower_target(filtered, joint_offset)
 
-        # ── 发从臂（一直跟） ──
-        follower.MotionCtrl_2(0x01, 0x01, speed_percent, 0xAD)
-        follower.JointCtrl(*target_joints)
-
         # ── 夹爪 ──
         gripper_units = read_gripper(leader)
         if gripper_units is not None:
@@ -364,48 +557,102 @@ def _follow_loop(
             if command_gripper:
                 follower.GripperCtrl(state.last_gripper_units, gripper_effort, 0x01, 0)
 
-        # ── 录制时存帧 ──
-        if state.recording:
-            task = state.current_task
-            if task is None:
-                logging.error("Recording is active without a current task; skipping frame")
-                time.sleep(period)
-                continue
-            action_gripper_m = (
-                float(state.last_gripper_units) / 1_000_000.0
-                if state.last_gripper_units is not None
-                else _read_gripper_m(follower)
-            )
-            state_pose = _model_pose_from_sdk_units(
-                _read_sdk_pose_units(follower), frames
-            )
-            state_gripper_m = (
-                float(state.last_gripper_units) / 1_000_000.0
-                if state.last_gripper_units is not None
-                else _read_gripper_m(follower)
-            )
-            state_pose = np.concatenate(
-                [state_pose, np.asarray([state_gripper_m], dtype=np.float32)]
-            ).astype(np.float32)
-            action_pose = _model_pose_from_target_joints(fk, target_joints, frames)
+        # ── 3. send_action：发送经过滤波/限速后的实际目标 ──
+        follower.MotionCtrl_2(0x01, 0x01, speed_percent, 0xAD)
+        follower.JointCtrl(*target_joints)
+        action_sent_timestamp_ns = time.monotonic_ns()
 
-            frame = {
-                "observation.state": state_pose,
-                "observation.leader_joints": leader_joints_deg,
-                "observation.follower_joints": follower_joints_deg,
-                "action": np.concatenate(
-                    [action_pose, np.asarray([action_gripper_m], dtype=np.float32)]
-                ).astype(np.float32),
-            }
-            frame.update(
-                _camera_frames_for_timestamp(
-                    camera_buffers, host_timestamp_ns, camera_tolerance_ms
-                )
-            )
-            dataset.add_frame(frame, task=task)
+        # ── 4. record：保存 observation + 实际发送的 action ──
+        if capture_recording_frame:
+            with state.record_lock:
+                if state.recording:
+                    task = state.current_task
+                    if task is None:
+                        logging.error(
+                            "Recording is active without a task; skipping sample"
+                        )
+                    elif camera_observation is None:
+                        state.skipped_camera_samples += 1
+                    else:
+                        previous_ns = (
+                            state.recorded_sample_ns[-1]
+                            if state.recorded_sample_ns
+                            else None
+                        )
+                        actual_dt_s = (
+                            0.0
+                            if previous_ns is None
+                            else (sample_start_ns - previous_ns) / 1e9
+                        )
+                        actual_fps = (
+                            0.0 if actual_dt_s <= 0 else 1.0 / actual_dt_s
+                        )
+                        action_gripper_m = (
+                            float(state.last_gripper_units) / 1_000_000.0
+                            if state.last_gripper_units is not None
+                            else state_gripper_m
+                        )
+                        action_pose = _model_pose_from_target_joints(
+                            fk, target_joints, frames
+                        )
+                        frame = {
+                            "observation.state": state_pose,
+                            "observation.leader_joints": leader_joints_deg,
+                            "observation.follower_joints": follower_joints_deg,
+                            "action": np.concatenate(
+                                [
+                                    action_pose,
+                                    np.asarray(
+                                        [action_gripper_m], dtype=np.float32
+                                    ),
+                                ]
+                            ).astype(np.float32),
+                            "recording.sample_monotonic_ns": np.asarray(
+                                [sample_start_ns], dtype=np.int64
+                            ),
+                            "recording.sample_wall_time_ns": np.asarray(
+                                [sample_wall_time_ns], dtype=np.int64
+                            ),
+                            "recording.observation_monotonic_ns": np.asarray(
+                                [observation_timestamp_ns], dtype=np.int64
+                            ),
+                            "recording.action_sent_monotonic_ns": np.asarray(
+                                [action_sent_timestamp_ns], dtype=np.int64
+                            ),
+                            "recording.actual_dt_s": np.asarray(
+                                [actual_dt_s], dtype=np.float32
+                            ),
+                            "recording.actual_fps": np.asarray(
+                                [actual_fps], dtype=np.float32
+                            ),
+                            "recording.target_fps": np.asarray(
+                                [fps], dtype=np.float32
+                            ),
+                        }
+                        frame.update(camera_observation)
+                        # Omit timestamp= intentionally: official LeRobot
+                        # keeps timestamp on frame_index / dataset.fps.
+                        dataset.add_frame(frame, task=task)
+                        state.recorded_sample_ns.append(sample_start_ns)
 
-        # ── 定周期 ──
-        time.sleep(period)
+        # ── fixed-rate control，扣除本轮处理耗时 ──
+        next_deadline_ns += period_ns
+        now_ns = time.monotonic_ns()
+        if now_ns <= next_deadline_ns:
+            _sleep_until_ns(next_deadline_ns)
+        else:
+            missed_intervals = (now_ns - next_deadline_ns) // period_ns + 1
+            with state.record_lock:
+                if state.recording:
+                    state.control_overruns += int(missed_intervals)
+            logging.warning(
+                "Control loop overrun by %.2f ms (%d interval%s)",
+                (now_ns - next_deadline_ns) / 1_000_000.0,
+                missed_intervals,
+                "s" if missed_intervals != 1 else "",
+            )
+            # Do not replay missed control points in a burst.
+            next_deadline_ns = now_ns
 
 
 def run_continuous_record(
@@ -428,7 +675,7 @@ def run_continuous_record(
     camera_buffers: dict[str, FrameBuffer],
     camera_tolerance_ms: float,
 ) -> None:
-    """主循环：跟随线程 50Hz 持续运行，主线程 ENTER 控制录制启停。"""
+    """主循环：固定频率持续跟随，主线程 ENTER 控制录制启停。"""
     state = _FollowState()
 
     # 首次使能夹爪
@@ -472,17 +719,55 @@ def run_continuous_record(
         input("  Press ENTER to START recording …")
 
         dataset.episode_buffer = dataset.create_episode_buffer()
-        state.current_task = task
-        state.recording = True
+        state.begin_episode(task)
         logging.info("Recording — press ENTER to stop")
 
         input()
-        state.recording = False
+        timestamps_ns, skipped_camera_samples, control_overruns = (
+            state.finish_episode()
+        )
+        if not timestamps_ns:
+            raise RuntimeError(
+                "Episode contains no valid frames. Check camera freshness and "
+                "increase --camera-sync-tolerance-ms only if timestamps justify it."
+            )
 
         logging.info("Stopped — saving episode …")
         dataset.save_episode()
+        timing_summary = _summarize_episode_timing(
+            timestamps_ns,
+            fps,
+            skipped_camera_samples,
+            control_overruns,
+        )
+        _append_episode_timing_metadata(
+            dataset.root,
+            ep_idx,
+            task,
+            timing_summary,
+        )
         logging.info("Episode saved: %s", task)
-        state.current_task = None
+        logging.info(
+            "Timing: target=%.3f Hz measured=%.3f Hz frames=%d "
+            "median_dt=%.3f ms skipped_camera=%d overruns=%d",
+            timing_summary.target_fps,
+            timing_summary.measured_fps,
+            timing_summary.frames,
+            timing_summary.median_dt_s * 1000.0,
+            timing_summary.skipped_camera_samples,
+            timing_summary.control_overruns,
+        )
+        if (
+            timing_summary.measured_fps > 0
+            and abs(timing_summary.measured_fps - timing_summary.target_fps)
+            / timing_summary.target_fps
+            > 0.05
+        ):
+            logging.warning(
+                "Measured episode rate differs from the LeRobot nominal fps by "
+                "more than 5%%. Use recording_timing.jsonl as ground truth and "
+                "lower --fps before collecting the final dataset."
+            )
 
     state.stop_event.set()
     follow_thread.join(timeout=2.0)
@@ -528,7 +813,7 @@ def main() -> None:
     # ── dataset ──
     parser.add_argument("--repo-id", type=str, required=True)
     parser.add_argument("--root", type=str, default=None)
-    parser.add_argument("--fps", type=int, default=50)
+    parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--tasks", type=str, required=True,
                         help="Path to tasks JSON file (list of task strings)")
@@ -555,6 +840,14 @@ def main() -> None:
 
     if not 1 <= args.speed_percent <= 100:
         raise ValueError("--speed-percent must be in [1, 100]")
+    if args.fps <= 0:
+        raise ValueError("--fps must be positive")
+    if args.camera_sync_tolerance_ms <= 0:
+        raise ValueError("--camera-sync-tolerance-ms must be positive")
+    if not 0.0 <= args.alpha <= 1.0:
+        raise ValueError("--alpha must be in [0, 1]")
+    if not 0.0 <= args.gripper_alpha <= 1.0:
+        raise ValueError("--gripper-alpha must be in [0, 1]")
 
     # ── load config & tasks ──
     config = load_config(args.config)
@@ -575,6 +868,29 @@ def main() -> None:
         and hasattr(config, "cameras")
         and any(c.enabled for c in config.cameras.values())
     )
+    if use_cameras:
+        camera_rates = {
+            name: camera.fps
+            for name, camera in config.cameras.items()
+            if camera.enabled
+        }
+        slower_cameras = {
+            name: rate for name, rate in camera_rates.items() if rate < args.fps
+        }
+        if slower_cameras:
+            logging.warning(
+                "Requested control/data rate is %d Hz but cameras are slower: %s. "
+                "Frames may repeat; per-frame camera timestamps and frame numbers "
+                "will preserve the true image timing.",
+                args.fps,
+                slower_cameras,
+            )
+    logging.info(
+        "Recording rate target: %d Hz (%.3f ms period); actual timing is stored "
+        "per frame and in meta/recording_timing.jsonl",
+        args.fps,
+        1000.0 / args.fps,
+    )
     camera_buffers, cameras = _start_cameras(config, use_cameras)
 
     # ── arms ──
@@ -583,6 +899,7 @@ def main() -> None:
     leader_connected = False
     follower_connected = False
     command_gripper = not args.no_gripper
+    dataset = None
 
     try:
         # ── connect ──
@@ -650,7 +967,8 @@ def main() -> None:
     except KeyboardInterrupt:
         logging.info("Interrupted — saving current episode if any …")
         try:
-            dataset.save_episode()
+            if dataset is not None and dataset.episode_buffer is not None:
+                dataset.save_episode()
         except Exception:
             pass
     finally:
@@ -664,7 +982,7 @@ def main() -> None:
         for cam in cameras:
             cam.stop()
         logging.info("Disconnected. Dataset root: %s",
-                     dataset.root if hasattr(dataset, "root") else "?")
+                     dataset.root if dataset is not None else "?")
 
 
 if __name__ == "__main__":
