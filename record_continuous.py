@@ -79,9 +79,12 @@ def _model_pose_from_target_joints(fk, target_joint_units: list[int],
     return np.concatenate([position_m.astype(np.float32), euler_rad.astype(np.float32)])
 
 
-def _read_gripper_m(piper) -> float:
+def _read_gripper_m(piper) -> float | None:
     value = read_gripper(piper)
-    return 0.0 if value is None else float(value) / 1_000_000.0
+    # A missing follower measurement must never be turned into a valid-looking
+    # closed-gripper observation. LeRobot records Present_Position as the
+    # observation; if Piper cannot provide it, the whole sample is invalid.
+    return None if value is None else float(value) / 1_000_000.0
 
 
 # ── dataset ─────────────────────────────────────────────────────────────
@@ -369,6 +372,7 @@ class _FollowState:
         self.record_lock = threading.Lock()
         self.recorded_sample_ns: list[int] = []
         self.skipped_camera_samples: int = 0
+        self.skipped_gripper_samples: int = 0
         self.control_overruns: int = 0
 
     def begin_episode(self, task: str) -> None:
@@ -376,16 +380,18 @@ class _FollowState:
             self.current_task = task
             self.recorded_sample_ns = []
             self.skipped_camera_samples = 0
+            self.skipped_gripper_samples = 0
             self.control_overruns = 0
             self.recording = True
 
-    def finish_episode(self) -> tuple[list[int], int, int]:
+    def finish_episode(self) -> tuple[list[int], int, int, int]:
         with self.record_lock:
             self.recording = False
             self.current_task = None
             return (
                 self.recorded_sample_ns.copy(),
                 self.skipped_camera_samples,
+                self.skipped_gripper_samples,
                 self.control_overruns,
             )
 
@@ -401,6 +407,7 @@ class _EpisodeTimingSummary:
     min_dt_s: float
     max_dt_s: float
     skipped_camera_samples: int
+    skipped_gripper_samples: int
     control_overruns: int
 
 
@@ -408,6 +415,7 @@ def _summarize_episode_timing(
     timestamps_ns: list[int],
     target_fps: float,
     skipped_camera_samples: int,
+    skipped_gripper_samples: int,
     control_overruns: int,
 ) -> _EpisodeTimingSummary:
     if len(timestamps_ns) < 2:
@@ -421,6 +429,7 @@ def _summarize_episode_timing(
             min_dt_s=0.0,
             max_dt_s=0.0,
             skipped_camera_samples=skipped_camera_samples,
+            skipped_gripper_samples=skipped_gripper_samples,
             control_overruns=control_overruns,
         )
     deltas_s = np.diff(np.asarray(timestamps_ns, dtype=np.int64)) / 1e9
@@ -435,6 +444,7 @@ def _summarize_episode_timing(
         min_dt_s=float(np.min(deltas_s)),
         max_dt_s=float(np.max(deltas_s)),
         skipped_camera_samples=skipped_camera_samples,
+        skipped_gripper_samples=skipped_gripper_samples,
         control_overruns=control_overruns,
     )
 
@@ -512,10 +522,17 @@ def _follow_loop(
         state_pose = _model_pose_from_sdk_units(
             _read_sdk_pose_units(follower), frames
         )
-        state_gripper_m = _read_gripper_m(follower)
-        state_pose = np.concatenate(
-            [state_pose, np.asarray([state_gripper_m], dtype=np.float32)]
-        ).astype(np.float32)
+        follower_gripper_m = _read_gripper_m(follower)
+        state_pose = (
+            None
+            if follower_gripper_m is None
+            else np.concatenate(
+                [
+                    state_pose,
+                    np.asarray([follower_gripper_m], dtype=np.float32),
+                ]
+            ).astype(np.float32)
+        )
         observation_timestamp_ns = time.monotonic_ns()
         camera_observation = (
             _camera_observation(
@@ -571,6 +588,10 @@ def _follow_loop(
                         logging.error(
                             "Recording is active without a task; skipping sample"
                         )
+                    elif state_pose is None:
+                        # Keep following the leader, but never save a sample
+                        # whose follower gripper observation is fabricated.
+                        state.skipped_gripper_samples += 1
                     elif camera_observation is None:
                         state.skipped_camera_samples += 1
                     else:
@@ -590,7 +611,7 @@ def _follow_loop(
                         action_gripper_m = (
                             float(state.last_gripper_units) / 1_000_000.0
                             if state.last_gripper_units is not None
-                            else state_gripper_m
+                            else float(follower_gripper_m)
                         )
                         action_pose = _model_pose_from_target_joints(
                             fk, target_joints, frames
@@ -723,7 +744,12 @@ def run_continuous_record(
         logging.info("Recording — press ENTER to stop")
 
         input()
-        timestamps_ns, skipped_camera_samples, control_overruns = (
+        (
+            timestamps_ns,
+            skipped_camera_samples,
+            skipped_gripper_samples,
+            control_overruns,
+        ) = (
             state.finish_episode()
         )
         if not timestamps_ns:
@@ -738,6 +764,7 @@ def run_continuous_record(
             timestamps_ns,
             fps,
             skipped_camera_samples,
+            skipped_gripper_samples,
             control_overruns,
         )
         _append_episode_timing_metadata(
@@ -749,12 +776,14 @@ def run_continuous_record(
         logging.info("Episode saved: %s", task)
         logging.info(
             "Timing: target=%.3f Hz measured=%.3f Hz frames=%d "
-            "median_dt=%.3f ms skipped_camera=%d overruns=%d",
+            "median_dt=%.3f ms skipped_camera=%d skipped_gripper=%d "
+            "overruns=%d",
             timing_summary.target_fps,
             timing_summary.measured_fps,
             timing_summary.frames,
             timing_summary.median_dt_s * 1000.0,
             timing_summary.skipped_camera_samples,
+            timing_summary.skipped_gripper_samples,
             timing_summary.control_overruns,
         )
         if (

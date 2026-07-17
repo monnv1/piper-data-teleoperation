@@ -157,6 +157,7 @@ def test_episode_timing_reports_measured_rate():
         [1_000_000_000, 1_025_000_000, 1_050_000_000],
         target_fps=40,
         skipped_camera_samples=2,
+        skipped_gripper_samples=3,
         control_overruns=1,
     )
 
@@ -164,6 +165,7 @@ def test_episode_timing_reports_measured_rate():
     assert summary.measured_fps == pytest.approx(40.0)
     assert summary.median_dt_s == pytest.approx(0.025)
     assert summary.skipped_camera_samples == 2
+    assert summary.skipped_gripper_samples == 3
     assert summary.control_overruns == 1
 
 
@@ -172,6 +174,7 @@ def test_episode_timing_sidecar_documents_timestamp_semantics(tmp_path):
         [1_000_000_000, 1_025_000_000],
         target_fps=40,
         skipped_camera_samples=0,
+        skipped_gripper_samples=0,
         control_overruns=0,
     )
 
@@ -251,3 +254,139 @@ def test_control_loop_uses_lerobot_observation_action_send_order(monkeypatch):
         "follower.motion",
         "follower.send",
     ]
+
+
+def test_control_loop_records_measured_follower_and_sent_gripper_separately(
+    monkeypatch,
+):
+    class Arm:
+        def __init__(self, name):
+            self.name = name
+
+        def MotionCtrl_2(self, *_args):
+            pass
+
+        def JointCtrl(self, *_args):
+            state.stop_event.set()
+
+        def GripperCtrl(self, *_args):
+            pass
+
+    class Dataset:
+        def __init__(self):
+            self.frames = []
+
+        def add_frame(self, frame, task):
+            self.frames.append((frame, task))
+
+    leader = Arm("leader")
+    follower = Arm("follower")
+    dataset = Dataset()
+    state = recorder._FollowState()
+    state.begin_episode("test")
+
+    monkeypatch.setattr(recorder, "read_joints", lambda _arm: [0] * 6)
+    monkeypatch.setattr(
+        recorder,
+        "read_gripper",
+        lambda arm: 50_000 if arm is leader else 10_000,
+    )
+    monkeypatch.setattr(recorder, "_read_sdk_pose_units", lambda _arm: np.zeros(6))
+    monkeypatch.setattr(
+        recorder,
+        "_model_pose_from_sdk_units",
+        lambda _pose, _frames: np.zeros(6, dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        recorder,
+        "_model_pose_from_target_joints",
+        lambda _fk, _target, _frames: np.zeros(6, dtype=np.float32),
+    )
+
+    recorder._follow_loop(
+        leader=leader,
+        follower=follower,
+        state=state,
+        dataset=dataset,
+        fps=40,
+        speed_percent=10,
+        alpha=1.0,
+        max_step_units=2_000,
+        joint_offset=[0] * 6,
+        command_gripper=True,
+        gripper_effort=1_000,
+        gripper_alpha=1.0,
+        gripper_max_step_units=100_000,
+        camera_buffers={},
+        camera_tolerance_ms=50.0,
+        fk=None,
+        frames=None,
+    )
+
+    assert len(dataset.frames) == 1
+    frame, task = dataset.frames[0]
+    assert task == "test"
+    assert frame["observation.state"][6] == pytest.approx(0.01)
+    assert frame["action"][6] == pytest.approx(0.05)
+    assert frame["observation.state"][6] != frame["action"][6]
+
+
+def test_control_loop_skips_sample_without_follower_gripper_feedback(monkeypatch):
+    class Arm:
+        def __init__(self, name):
+            self.name = name
+
+        def MotionCtrl_2(self, *_args):
+            pass
+
+        def JointCtrl(self, *_args):
+            state.stop_event.set()
+
+    class Dataset:
+        def __init__(self):
+            self.frames = []
+
+        def add_frame(self, frame, task):
+            self.frames.append((frame, task))
+
+    leader = Arm("leader")
+    follower = Arm("follower")
+    dataset = Dataset()
+    state = recorder._FollowState()
+    state.begin_episode("test")
+
+    monkeypatch.setattr(recorder, "read_joints", lambda _arm: [0] * 6)
+    monkeypatch.setattr(
+        recorder,
+        "read_gripper",
+        lambda arm: 50_000 if arm is leader else None,
+    )
+    monkeypatch.setattr(recorder, "_read_sdk_pose_units", lambda _arm: np.zeros(6))
+    monkeypatch.setattr(
+        recorder,
+        "_model_pose_from_sdk_units",
+        lambda _pose, _frames: np.zeros(6, dtype=np.float32),
+    )
+
+    recorder._follow_loop(
+        leader=leader,
+        follower=follower,
+        state=state,
+        dataset=dataset,
+        fps=40,
+        speed_percent=10,
+        alpha=1.0,
+        max_step_units=2_000,
+        joint_offset=[0] * 6,
+        command_gripper=False,
+        gripper_effort=1_000,
+        gripper_alpha=1.0,
+        gripper_max_step_units=100_000,
+        camera_buffers={},
+        camera_tolerance_ms=50.0,
+        fk=None,
+        frames=None,
+    )
+
+    assert dataset.frames == []
+    assert state.skipped_gripper_samples == 1

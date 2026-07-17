@@ -67,6 +67,11 @@ python -m teleoperation.teleop --speed-percent 5 --alpha 0.3
 
 Leader 始终处于 Standby 可拖动状态，follower 全程 MIT 跟随。按 ENTER 开始/停止录制。每个控制周期遵循 LeRobot 官方顺序：先读取完整 follower observation（关节、末端、夹爪和相机），再读取 leader action，发送经过滤波/限速的 follower 目标，最后把 observation 与实际发送的 action 写入同一帧。
 
+夹爪同样遵循该语义：`observation.state[6]` 是发送前读取的
+follower 实际开口，`action[6]` 是本周期过滤/限速后实际下发的目标。
+如果 follower 夹爪反馈暂时不可用，该帧会被丢弃而不会用 `0.0` 伪造，
+丢帧数记录在 episode timing 的 `skipped_gripper_samples` 中。
+
 ```bash
 python -m teleoperation.record_continuous \
   --repo-id local/piper-demo \
